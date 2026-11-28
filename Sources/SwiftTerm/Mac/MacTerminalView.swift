@@ -2057,7 +2057,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     
     public override func cursorUpdate(with event: NSEvent)
     {
-        setPointer()
+        setPointer(at: convert(event.locationInWindow, from: nil))
     }
 
     /// The pointer shown over the terminal while `modifiers` are held: the
@@ -2086,16 +2086,27 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     /// Reads the keys held now unless given, since an event's flags can miss a
     /// Shift held since before the cursor update AppKit sends after a rect change.
-    private func setPointer(modifiers: NSEvent.ModifierFlags? = nil) {
-        let modifiers = modifiers ?? heldModifierFlags()
+    private func setPointer(at point: NSPoint, modifiers: NSEvent.ModifierFlags? = nil) {
+        guard let hit = hitTest(convert(point, to: superview)), isTerminalPointerView(hit) else { return }
         // AppKit calls cursorUpdate on every mouse move over the view and on every display
         // cycle that re-evaluates cursor rects. With a customized pointer (size or
         // colour in Accessibility settings) each set() re-renders the cursor image,
         // so setting the cursor that is already current is expensive. Skip it.
-        let cursor = pointerCursor(modifiers: modifiers)
+        let cursor = pointerCursor(at: point, modifiers: modifiers ?? heldModifierFlags())
         if NSCursor.current != cursor {
             cursor.set()
         }
+    }
+
+    // Use the click policy so the hand only appears when a link can be activated.
+    func pointerCursor(at point: NSPoint, modifiers: NSEvent.ModifierFlags) -> NSCursor {
+        let cursor = pointerCursor(modifiers: modifiers)
+        guard visibleRect.contains(point),
+              point.x < getEffectiveWidth(size: bounds.size) else { return cursor }
+        let hit = calculateMouseHit(at: point).grid
+        let command = modifiers.contains(.command)
+        updateHoverLink(at: hit, commandOverride: command)
+        return linkForClick(at: hit, hasCommandModifier: command) == nil ? cursor : .pointingHand
     }
 
     /// The cursor the rect was last built with, so that a change of the rule
@@ -2192,33 +2203,31 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if pointerCursor(modifiers: []) != cursorRectPointer {
             window.invalidateCursorRects(for: self)
         }
-        if pointerIsOver(window) {
-            setPointer(modifiers: modifiers)
+        if let point = pointerLocation(over: window) {
+            setPointer(at: point, modifiers: modifiers)
         }
     }
 
-    /// Whether the pointer is over this view's text where it shows: a visible
-    /// window, no hidden ancestor, and no other window or view above it at that
-    /// point, the view's own subviews included, such as the find bar, whose
-    /// fields show their own pointer. The Metal surface and the overlay of
-    /// composed text count as the text.
-    private func pointerIsOver(_ window: NSWindow) -> Bool {
+    /// The pointer location over terminal text in the topmost window.
+    /// Find controls supply their own pointer; Metal and composed text count as terminal text.
+    private func pointerLocation(over window: NSWindow) -> NSPoint? {
         guard window.isVisible, !isHiddenOrHasHiddenAncestor,
               let contentView = window.contentView,
               let location = pointerLocationInTopmostWindow(window) else {
-            return false
+            return nil
         }
         let point = contentView.superview?.convert(location, from: nil) ?? location
-        guard let hit = contentView.hitTest(point) else { return false }
-        if hit === self || hit === markedTextOverlay {
-            return true
-        }
+        guard let hit = contentView.hitTest(point), isTerminalPointerView(hit) else { return nil }
+        return convert(location, from: nil)
+    }
+
+    private func isTerminalPointerView(_ hit: NSView) -> Bool {
+        if hit === self || hit === markedTextOverlay { return true }
 #if canImport(MetalKit)
-        if let metalView, hit === metalView {
-            return true
-        }
-#endif
+        return hit === metalView
+#else
         return false
+#endif
     }
     
     func makeFirstResponder ()
@@ -2332,13 +2341,13 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     func startTracking ()
     {
         if tracking == nil {
-            var options: NSTrackingArea.Options = [.activeAlways, .mouseEnteredAndExited]
+            var options: NSTrackingArea.Options = [.activeAlways, .mouseEnteredAndExited, .cursorUpdate, .inVisibleRect]
             if #available(macOS 26, *) {
                 // See the Tahoe WindowServer workaround above.
             } else {
                 options.insert(.mouseMoved)
             }
-            tracking = NSTrackingArea (rect: frame, options: options, owner: self, userInfo: [:])
+            tracking = NSTrackingArea (rect: .zero, options: options, owner: self, userInfo: [:])
             addTrackingArea(tracking!)
         }
         startWindowMouseMovedFallback()
@@ -2401,7 +2410,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if commandActive {
             return true
         }
-        if linkHighlightMode == .hover {
+        if linkHighlightMode == .hover || linkHighlightMode == .always {
             return true
         }
         if linkHighlightMode == .hoverWithModifier && commandActive {
@@ -2485,6 +2494,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
         keyboardRouter.flagsChanged(event)
         super.flagsChanged(with: event)
+        refreshPointer(modifiers: event.modifierFlags)
     }
     
     public override func mouseExited(with event: NSEvent) {
@@ -4052,14 +4062,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
     
     public override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
         if #available(macOS 26, *) {
             // On macOS 26 movement arrives via `acceptsMouseMovedEvents`, which delivers
             // to the first responder regardless of the pointer's location. Ignore moves
             // outside our bounds so we do not report cells the pointer is not over.
-            let point = convert(event.locationInWindow, from: nil)
             if !bounds.contains(point) { return }
         }
-        let hit = calculateMouseHit(with: event)
+        let hit = calculateMouseHit(at: point)
         if commandActive {
             if let payload = getPayload(for: event) as? String {
                 previewUrl (payload: payload)
@@ -4068,7 +4078,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             }
             reportLink(at: hit.grid)
         }
-        updateHoverLink(at: hit.grid)
+        setPointer(at: point, modifiers: event.modifierFlags)
         
         if withTerminal({ $0.mouseMode.sendMotionEvent() }) {
             let flags = encodeMouseEvent(with: event, overwriteRelease: true)
