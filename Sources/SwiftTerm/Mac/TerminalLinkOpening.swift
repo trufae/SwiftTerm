@@ -166,17 +166,22 @@ extension TerminalView {
             return
         }
         guard allowsLink(isExplicit: isExplicit) else { return }
+        let target = linkTarget(link, isExplicit: isExplicit)
+        TerminalLinkOpening.request(target, window: window, presentAlert: presentAlert) { [weak self] url in
+            guard let self, allowsLink(isExplicit: isExplicit) else { return }
+            approved(url)
+        }
+    }
+
+    /// The target checked by the default opener and the cursor.
+    func linkTarget(_ link: String, isExplicit: Bool) -> UntrustedTerminalLink {
         var pathBase = Self.linkPathBase(hostCurrentDirectory: withTerminal { $0.hostCurrentDirectory })
         // Only the host can tell that the session is local. A remote host in
         // OSC 7 still blocks local paths.
         if !resolvesLinksAgainstShellDirectory, pathBase != .remote {
             pathBase = .processDirectory
         }
-        let target = Self.defaultLinkTarget(link, isExplicit: isExplicit, pathBase: pathBase)
-        TerminalLinkOpening.request(target, window: window, presentAlert: presentAlert) { [weak self] url in
-            guard let self, allowsLink(isExplicit: isExplicit) else { return }
-            approved(url)
-        }
+        return Self.defaultLinkTarget(link, isExplicit: isExplicit, pathBase: pathBase)
     }
 
     /// A checked URL, and how to open it, for the deprecated delegate method.

@@ -2098,15 +2098,46 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
-    // Use the click policy so the hand only appears when a link can be activated.
+    /// Whether the cursor follows SwiftTerm's default opening policy. Hosts
+    /// that handle link requests themselves can use the visibility rules alone.
+    public var usesDefaultLinkPolicyForCursor = true {
+        didSet { cursorLinkDecision = nil }
+    }
+    private var cursorLinkDecision: (link: String, explicit: Bool, directory: String?,
+                                     resolvesAgainstShell: Bool, allowed: Bool)?
+
     func pointerCursor(at point: NSPoint, modifiers: NSEvent.ModifierFlags) -> NSCursor {
         let cursor = pointerCursor(modifiers: modifiers)
         guard visibleRect.contains(point),
-              point.x < getEffectiveWidth(size: bounds.size) else { return cursor }
+              point.x < getEffectiveWidth(size: bounds.size) else {
+            cursorLinkDecision = nil
+            return cursor
+        }
         let hit = calculateMouseHit(at: point).grid
         let command = modifiers.contains(.command)
         updateHoverLink(at: hit, commandOverride: command)
-        return linkForClick(at: hit, hasCommandModifier: command) == nil ? cursor : .pointingHand
+        guard let link = linkForClick(at: hit, hasCommandModifier: command) else {
+            cursorLinkDecision = nil
+            return cursor
+        }
+        return cursorAllowsLink(link.link, isExplicit: link.isExplicit) ? .pointingHand : cursor
+    }
+
+    private func cursorAllowsLink(_ link: String, isExplicit: Bool) -> Bool {
+        guard allowsLink(isExplicit: isExplicit) else { return false }
+        guard usesDefaultLinkPolicyForCursor else { return true }
+        let directory = withTerminal { $0.hostCurrentDirectory }
+        if let cached = cursorLinkDecision, cached.link == link, cached.explicit == isExplicit,
+           cached.directory == directory, cached.resolvesAgainstShell == resolvesLinksAgainstShellDirectory {
+            return cached.allowed
+        }
+
+        // Reuse the verdict while hovering; opening a link still checks it again.
+        let target = linkTarget(link, isExplicit: isExplicit)
+        let allowed: Bool
+        if case .deny = target.decision { allowed = false } else { allowed = true }
+        cursorLinkDecision = (link, isExplicit, directory, resolvesLinksAgainstShellDirectory, allowed)
+        return allowed
     }
 
     /// The cursor the rect was last built with, so that a change of the rule
@@ -2498,6 +2529,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
     
     public override func mouseExited(with event: NSEvent) {
+        cursorLinkDecision = nil
         turnOffUrlPreview()
         if linkHighlightMode == .hover || linkHighlightMode == .hoverWithModifier {
             let oldRange = linkHighlightRange
